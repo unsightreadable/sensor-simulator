@@ -20,6 +20,74 @@
 #include <chrono>
 #include <thread>
 #include <random>
+#include <cmath>
+
+// --- Optical Physics Engine (Cortem K13-253 Specification) ---
+struct GlassSpecs {
+    const char* n_mod;      // Model Number
+    double phi_nominal;     // Ø Diameter (mm)
+    double phi_tol_pos;     // Ø Tolerance +
+    double phi_tol_neg;     // Ø Tolerance -
+    double s_nominal;       // S Thickness (mm)
+    double s_tol_pos;       // S Tolerance +
+    double s_tol_neg;       // S Tolerance -
+
+    double refractive_idx;  // 1.52 for tempered glass
+    double alpha;           // Absorption coefficient per mm (~0.005)
+};
+
+struct OpticalDiagnostics {
+    double s_max_mm;              // Calculated worst-case thickness
+    double transmission_pct;      // Total light making it through
+    double display_gain;          // Multiplier needed for 100% perceived brightness
+    double surface_reflectance;   // Primary reflection at boundary
+    double internal_glare_ratio;  // Secondary bounce causing halo
+};
+
+OpticalDiagnostics calculateOptics(const GlassSpecs& specs) {
+    // Calculate worst-case optical depth (S nominal + max positive tolerance)
+    double s_max = specs.s_nominal + specs.s_tol_pos;
+
+    // 1. Boundary Reflection (Fresnel) at normal incidence
+    double n1 = 1.0;                  // Air
+    double n2 = specs.refractive_idx; // Glass
+    double R  = std::pow((n1 - n2) / (n1 + n2), 2.0);
+
+    // 2. Two-interface transmission (entry + exit surfaces)
+    double transmittance_reflection = std::pow(1.0 - R, 2.0);
+
+    // 3. Material Absorption (Beer-Lambert), primary ray traverses s_max once
+    double transmittance_absorption = std::exp(-specs.alpha * s_max);
+
+    // 4. Total Transmittance
+    double total_transmittance = transmittance_reflection * transmittance_absorption;
+
+    // 5. Internal Glare (ghost ray / secondary reflection)
+    //
+    //    Path of the ghost ray:
+    //      Entry surface  → glass (1 pass, forward)
+    //      Back surface   → reflects (R)
+    //      Front surface  → reflects again (R)
+    //      Exit surface   → exits glass
+    //
+    //    The ghost ray therefore:
+    //      - Crosses both air-glass boundaries twice  → (1-R)²  factor
+    //      - Reflects at back surface once            → R
+    //      - Reflects at front surface once           → R
+    //      - Traverses the thickness THREE times      → exp(-3αd)
+    //
+    //    internal_glare = (1-R)² · R² · exp(-3αd)
+    double t_abs_triple  = std::exp(-specs.alpha * s_max * 3.0);
+    double internal_glare = std::pow(1.0 - R, 2.0) * R * R * t_abs_triple;
+
+    return {
+        s_max,
+        total_transmittance,
+        1.0 / total_transmittance,
+        R,
+        internal_glare
+    };
+}
 
 // Transmission settings
 static const int POST_INTERVAL_S   = 2;
@@ -35,7 +103,7 @@ static const char WATCHDOG_PATH[] = "/tmp/sensor_sim.watchdog";
 // Buffer sizes
 static const int CFG_FIELD_LEN = 256;
 static const int TIMESTAMP_LEN = 32;
-static const int JSON_BUF_LEN  = 512;
+static const int JSON_BUF_LEN  = 1024;
 static const int LOG_LINE_LEN  = 256;
 static const int ENV_LINE_LEN  = 512;
 
@@ -46,7 +114,6 @@ static const double TEMP_MIN  =  20.0,  TEMP_MAX  =  85.0;
 
 
 // Signal handling
-
 static volatile sig_atomic_t g_running = 1;
 
 void signalHandler(int sig) {
@@ -56,7 +123,6 @@ void signalHandler(int sig) {
 
 
 // Logging
-
 enum LogLevel { LOG_INFO = 0, LOG_WARN, LOG_ERROR };
 
 static const char* LOG_LABELS[] = { "INFO ", "WARN ", "ERROR" };
@@ -81,7 +147,6 @@ void logWrite(LogLevel level, const char* message) {
 
 
 // Watchdog
-
 void touchWatchdog() {
     FILE* fp = std::fopen(WATCHDOG_PATH, "w");
     if (!fp) {
@@ -97,7 +162,6 @@ void touchWatchdog() {
 
 
 // Config
-
 struct Config {
     char serverUrl[CFG_FIELD_LEN];
     char authToken[CFG_FIELD_LEN];
@@ -151,11 +215,11 @@ bool loadConfig(const char* path, Config& cfg) {
 
 
 // Sensor reading
-
 struct SensorReading {
     double    amps;
     double    volts;
     double    temperature;
+    OpticalDiagnostics optics;
     char      timestamp[TIMESTAMP_LEN];
     long long sequence;
 };
@@ -181,11 +245,19 @@ void readSensors(std::mt19937& rng, long long sequence, SensorReading& r) {
     std::time_t now = std::time(nullptr);
     std::strftime(r.timestamp, sizeof(r.timestamp),
                   "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&now));
+
+    // Calculate optics based on drawing: N° MOD K13-253
+    GlassSpecs k13_253 = {
+        "K13-253",
+        100.0, 0.5, 0.5,   // Ø = 100 +0.5 / -0.5
+        10.0,  0.2, 0.3,   // S = 10 +0.2 / -0.3
+        1.52,  0.005       // n=1.52, alpha=0.005
+    };
+    r.optics = calculateOptics(k13_253);
 }
 
 
 // JSON serialisation
-
 int buildJsonPayload(const SensorReading& r, const char* deviceId,
                      char* buf, int bufLen) {
     return std::snprintf(buf, static_cast<size_t>(bufLen),
@@ -197,15 +269,27 @@ int buildJsonPayload(const SensorReading& r, const char* deviceId,
         "    \"current\":     { \"value\": %.3f, \"unit\": \"A\" },\n"
         "    \"voltage\":     { \"value\": %.3f, \"unit\": \"V\" },\n"
         "    \"temperature\": { \"value\": %.3f, \"unit\": \"C\" }\n"
+        "  },\n"
+        "  \"optics\": {\n"
+        "    \"n_mod\": \"K13-253\",\n"
+        "    \"diameter_phi\": { \"nominal\": 100.0, \"tol_pos\": 0.5, \"tol_neg\": 0.5 },\n"
+        "    \"thickness_s\": { \"nominal\": 10.0, \"tol_pos\": 0.2, \"tol_neg\": 0.3 },\n"
+        "    \"active_s_max_mm\": %.1f,\n"
+        "    \"transmittance_pct\": %.4f,\n"
+        "    \"display_gain\": %.4f,\n"
+        "    \"surface_reflectance\": %.4f,\n"
+        "    \"internal_glare_ratio\": %.6f\n"
         "  }\n"
         "}",
         deviceId, r.sequence, r.timestamp,
-        r.amps, r.volts, r.temperature);
+        r.amps, r.volts, r.temperature,
+        r.optics.s_max_mm,
+        r.optics.transmission_pct, r.optics.display_gain,
+        r.optics.surface_reflectance, r.optics.internal_glare_ratio);
 }
 
 
 // HTTP POST
-
 enum TransmitResult {
     TX_OK          = 0,
     TX_ERR_NETWORK = 1,
@@ -214,7 +298,6 @@ enum TransmitResult {
 
 /*
     libcurl integration reference:
-
         CURL* curl = curl_easy_init();
         struct curl_slist* headers = nullptr;
         headers = curl_slist_append(headers, authHeader);
@@ -227,6 +310,7 @@ enum TransmitResult {
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
 */
+
 TransmitResult simulateHttpPost(const char* payload,
                                 const char* serverUrl,
                                 const char* authToken,
@@ -262,7 +346,6 @@ TransmitResult simulateHttpPost(const char* payload,
 
 
 // Main
-
 int main(int argc, char* argv[]) {
     std::signal(SIGINT,  signalHandler);
     std::signal(SIGTERM, signalHandler);
@@ -294,7 +377,8 @@ int main(int argc, char* argv[]) {
     std::printf("  device   : %s\n", cfg.deviceId);
     std::printf("  target   : %s\n", cfg.serverUrl);
     std::printf("  mode     : %s\n", modeLabel);
-    std::printf("  interval : %ds\n\n", POST_INTERVAL_S);
+    std::printf("  interval : %ds\n", POST_INTERVAL_S);
+    std::printf("  optics   : Spec N° MOD. K13-253 Active\n\n");
 
     logWrite(LOG_INFO, "Simulator started");
 
